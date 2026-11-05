@@ -1,0 +1,56 @@
+# Виртуальные окружения
+venv/
+.venv/
+env/
+ENV/
+
+# Байт-код Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Кэши и временные файлы
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Артефакты сборки
+build/
+dist/
+*.egg-info/
+*.whl
+
+# Файлы IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Системные файлы ОС
+.DS_Store
+Thumbs.db
+
+# Логи и временные данные
+*.log
+logs/
+tmp/
+temp/
+
+# Переменные окружения и секреты 
+.env
+*.env.local
+secrets.json
+
+# Jupyter / Colab 
+# *.ipynb_checkpoints/
+# .ipynb_checkpoints/
+
+data/raw/
+data/inbox/
+data/failed/
+data/processed/
+data/chunks/
+data/qdrant_local/
+notebooks/.ipynb_checkpoints/
