@@ -2,6 +2,8 @@ from flask import Flask, render_template, request, jsonify, send_file
 
 from app.config.settings import settings
 from app.db.models import db, Document, ChecklistItem, Finding, ProcessStep, RaciAssignment, CalendarActivity
+from flask import jsonify, request
+
 
 def create_app():
     app = Flask(__name__)

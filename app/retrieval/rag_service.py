@@ -1,7 +1,5 @@
 import json
-import re
 import requests
-from pathlib import Path
 
 import kuzu
 from sentence_transformers import SentenceTransformer
@@ -9,60 +7,116 @@ from qdrant_client import QdrantClient
 
 from app.config.settings import settings
 
-def get_clients():
-    qdrant = QdrantClient(path=str(settings.QDRANT_LOCAL_PATH))
-    embedder = SentenceTransformer(settings.EMBEDDING_MODEL)
-    database = kuzu.Database(str(settings.KUZU_DB_PATH))
-    graph = kuzu.Connection(database)
 
-    return qdrant, embedder, graph
+_qdrant_client = None
+_embedder = None
+
+
+def get_qdrant():
+    global _qdrant_client
+
+    if _qdrant_client is None:
+        _qdrant_client = QdrantClient(
+            path=str(settings.QDRANT_LOCAL_PATH)
+        )
+
+    return _qdrant_client
+
+
+def get_embedder():
+    global _embedder
+
+    if _embedder is None:
+        _embedder = SentenceTransformer(
+            settings.EMBEDDING_MODEL
+        )
+
+    return _embedder
+
 
 def vector_search(question, limit=5):
-    qdrant, embedder, _ = get_clients()
+    qdrant = get_qdrant()
+    embedder = get_embedder()
+
     vector = embedder.encode(question).tolist()
 
-    results = qdrant.search(
+    response = qdrant.query_points(
         collection_name=settings.QDRANT_COLLECTION,
-        query_vector=vector,
+        query=vector,
         limit=limit
     )
 
-    return [
-        {
-            "document_id": item.payload["document_id"],
-            "file_name": item.payload["file_name"],
-            "text": item.payload["text"]
-        }
-        for item in results
-    ]
+    chunks = []
 
-def graph_context(document_ids):
-    _, _, graph = get_clients()
-    context = []
-
-    for document_id in document_ids:
-        result = graph.query(
-            """
-            MATCH (d:Document {id: $id})
-            OPTIONAL MATCH (d)-[r:REPLACES]->(old:Document)
-            RETURN d.title, d.status, d.effective_date, collect(old.title)
-            """,
-            parameters={"id": document_id}
+    for item in response.points:
+        chunks.append(
+            {
+                "document_id": item.payload.get("document_id"),
+                "file_name": item.payload.get("file_name"),
+                "chunk_id": item.payload.get("chunk_id"),
+                "score": item.score,
+                "text": item.payload.get("text")
+            }
         )
 
-        for row in result:
-            context.append({
-                "document": row[0],
-                "status": row[1],
-                "effective_date": row[2],
-                "replaces": row[3]
-            })
+    return chunks
+
+
+def graph_context(document_ids):
+    database = kuzu.Database(
+        str(settings.KUZU_DB_PATH)
+    )
+
+    graph = kuzu.Connection(database)
+
+    context = []
+
+    try:
+        for document_id in document_ids:
+            result = graph.execute(
+                """
+                MATCH (d:Document {id: $id})
+                OPTIONAL MATCH (d)-[r:REPLACES]->(old:Document)
+                RETURN d.title, d.status, d.effective_date, collect(old.title)
+                """,
+                parameters={"id": document_id}
+            )
+
+            for row in result:
+                context.append(
+                    {
+                        "document": row[0],
+                        "status": row[1],
+                        "effective_date": row[2],
+                        "replaces": row[3]
+                    }
+                )
+
+    finally:
+        graph.close()
+        database.close()
 
     return context
 
+
 def answer_question(question):
     chunks = vector_search(question)
-    document_ids = list({chunk["document_id"] for chunk in chunks})
+
+    if not chunks:
+        return {
+            "answer": "В базе нет релевантных документов.",
+            "sources": [],
+            "graph": []
+        }
+
+    document_ids = list(
+        {
+            chunk["document_id"]
+            for chunk in chunks
+            if chunk["document_id"] is not None
+        }
+    )
+
     graph = graph_context(document_ids)
 
     prompt = f"""
@@ -77,9 +131,15 @@ def answer_question(question):
 Данные графа знаний:
 {json.dumps(graph, ensure_ascii=False, indent=2)}
 
+Правила:
+1. Отвечай только на основе предоставленных данных.
+2. Не придумывай документы, версии, даты или связи.
+3. Если данных недостаточно, прямо скажи об этом.
+4. Укажи, какие документы использованы.
+5. Если есть признаки устаревшего документа, укажи это.
+6. Если есть связи REPLACES, объясни их.
+
 Ответь на русском.
-Укажи актуальный документ, устаревшие документы, связи, риски и использованные файлы.
-Если данных недостаточно, прямо скажи об этом.
 """
 
     response = requests.post(
@@ -88,14 +148,20 @@ def answer_question(question):
             "model": settings.OLLAMA_MODEL,
             "prompt": prompt,
             "stream": False,
-            "options": {"temperature": 0}
+            "options": {
+                "temperature": 0,
+                "num_ctx": 4096
+            }
         },
         timeout=300
     )
+
     response.raise_for_status()
 
+    data = response.json()
+
     return {
-        "answer": response.json()["response"],
+        "answer": data.get("response", ""),
         "sources": chunks,
         "graph": graph
     }
