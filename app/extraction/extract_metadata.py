@@ -1,19 +1,16 @@
 import json
 import re
-from pathlib import Path
+from datetime import datetime
 
 import dateparser
 import requests
 
-JSON_DIR = Path("data/processed/json")
-META_DIR = Path("data/processed/metadata")
-
-OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL = "qwen2.5:7b-instruct"
+from app.db.models import db, Document, DocumentRelation
+from app.config.settings import settings
 
 DOC_TYPES = [
     "приказ", "распоряжение", "инструкция", "регламент",
-    "положение", "стандарт", "политика", "методика", "чертеж"
+    "положение", "стандарт", "политика", "методика","чертеж"
 ]
 
 NUMBER_RE = re.compile(
@@ -27,35 +24,35 @@ DATE_RE = re.compile(
 )
 
 REPLACES_RE = re.compile(
-    r"(?:взамен|взамен ранее действовавшего\w+|взамен отменного\w+)\s+(.{5,250}?)(?:\.|;|\n)",
+    r"(?:взамен|взамен ранее действовавш\w+|взамен отмен\w+)\s+(.{5,250}?)(?:\.|;|\n)",
     re.IGNORECASE
 )
 
 CANCELLED_RE = re.compile(
-    r"(считать\s+утратившим\w+\s+силу|утрачивает\s+силу|отменен\w+)",
+    r"(считать\s+утративш\w+\s+силу|утрачивает\s+силу|отмен\w+)",
     re.IGNORECASE
 )
 
-def extract_title(text: str):
-    for line in text.splitlines()[:30]:
+def extract_title(text):
+    for line in text.splitlines()[:40]:
         clean = line.strip()
         if len(clean) > 10 and any(t in clean.lower() for t in DOC_TYPES):
             return clean
     return None
 
-def extract_document_type(text: str):
-    lowered = text.lower()[:3000]
+def extract_document_type(text):
+    lowered = text.lower()[:5000]
     for doc_type in DOC_TYPES:
         if doc_type in lowered:
             return doc_type
     return None
 
-def extract_number(text: str):
-    match = NUMBER_RE.search(text[:5000])
+def extract_code(text):
+    match = NUMBER_RE.search(text[:8000])
     return match.group(1) if match else None
 
-def extract_date(text: str):
-    match = DATE_RE.search(text[:5000])
+def extract_date(text):
+    match = DATE_RE.search(text[:8000])
     if not match:
         return None
 
@@ -64,29 +61,35 @@ def extract_date(text: str):
         languages=["ru"],
         settings={"DATE_ORDER": "DMY"}
     )
-    return parsed.strftime("%Y-%m-%d") if parsed else None
+    return parsed.date() if parsed else None
 
-def extract_status(text: str):
-    if CANCELLED_RE.search(text[:8000]):
+def extract_status(text):
+    if CANCELLED_RE.search(text[:10000]):
         return "утратил силу"
     return "действует"
 
-def extract_replaces(text: str):
+def extract_replaces(text):
     return [
         match.group(1).strip()
-        for match in REPLACES_RE.finditer(text[:8000])
+        for match in REPLACES_RE.finditer(text[:10000])
     ]
 
-def llm_metadata(text: str):
+def llm_metadata(text):
     prompt = f"""
-Извлеки метаданные документа и верни только JSON:
+Извлеки паспорт корпоративного документа. Верни только JSON:
 {{
+  "code": null,
   "title": null,
   "document_type": null,
-  "document_number": null,
+  "version": null,
   "effective_date": null,
+  "owner": null,
+  "approving_order": null,
+  "approving_order_date": null,
+  "review_period_months": null,
   "status": null,
-  "replaces": []
+  "replaces": [],
+  "references": []
 }}
 
 Текст:
@@ -94,9 +97,9 @@ def llm_metadata(text: str):
 """
 
     response = requests.post(
-        OLLAMA_URL,
+        f"{settings.OLLAMA_BASE_URL}/api/generate",
         json={
-            "model": MODEL,
+            "model": settings.OLLAMA_MODEL,
             "prompt": prompt,
             "stream": False,
             "options": {"temperature": 0}
@@ -109,60 +112,68 @@ def llm_metadata(text: str):
     match = re.search(r"\{.*\}", raw, re.DOTALL)
     return json.loads(match.group()) if match else {}
 
-def enrich_with_llm(metadata: dict, text: str):
-    missing = [
-        key for key in [
-            "title", "document_type", "document_number", "effective_date"
-        ]
-        if not metadata.get(key)
-    ]
-
-    if not missing and not metadata.get("replaces"):
-        return metadata
-
+def enrich_document(document, text):
     try:
-        llm_result = llm_metadata(text)
+        data = llm_metadata(text)
     except Exception as exc:
         print(f"LLM fallback не сработал: {exc}")
-        return metadata
+        return
 
-    for key in missing:
-        if not metadata.get(key) and llm_result.get(key):
-            metadata[key] = llm_result[key]
+    fields = [
+        "code", "title", "document_type", "version", "owner",
+        "approving_order", "status"
+    ]
 
-    if not metadata.get("replaces") and llm_result.get("replaces"):
-        metadata["replaces"] = llm_result["replaces"]
+    for field in fields:
+        if not getattr(document, field, None) and data.get(field):
+            setattr(document, field, data[field])
 
-    return metadata
-
-def run():
-    META_DIR.mkdir(parents=True, exist_ok=True)
-
-    for file in JSON_DIR.glob("*.json"):
-        data = json.loads(file.read_text(encoding="utf-8"))
-        text = data["markdown"]
-
-        metadata = {
-            "file_name": data["file_name"],
-            "file_path": data["file_path"],
-            "title": extract_title(text),
-            "document_type": extract_document_type(text),
-            "document_number": extract_number(text),
-            "effective_date": extract_date(text),
-            "status": extract_status(text),
-            "replaces": extract_replaces(text),
-            "extraction_source": "rules"
-        }
-
-        metadata = enrich_with_llm(metadata, text)
-
-        out = META_DIR / file.name
-        out.write_text(
-            json.dumps(metadata, ensure_ascii=False, indent=2),
-            encoding="utf-8"
+    if not document.effective_date and data.get("effective_date"):
+        parsed = dateparser.parse(
+            str(data["effective_date"]),
+            languages=["ru"],
+            settings={"DATE_ORDER": "DMY"}
         )
+        if parsed:
+            document.effective_date = parsed.date()
 
-        print(f"Готово: {data['file_name']}")
+    if not document.approving_order_date and data.get("approving_order_date"):
+        parsed = dateparser.parse(
+            str(data["approving_order_date"]),
+            languages=["ru"],
+            settings={"DATE_ORDER": "DMY"}
+        )
+        if parsed:
+            document.approving_order_date = parsed.date()
+
+def extract_all(app):
+    with app.app_context():
+        documents = Document.query.all()
+
+        for document in documents:
+            text = document.markdown or ""
+
+            document.title = document.title or extract_title(text)
+            document.document_type = document.document_type or extract_document_type(text)
+            document.code = document.code or extract_code(text)
+            document.effective_date = document.effective_date or extract_date(text)
+            document.status = extract_status(text)
+
+            enrich_document(document, text)
+
+            for replaced_title in extract_replaces(text):
+                relation = DocumentRelation(
+                    source_document_id=document.id,
+                    relation_type="REPLACES",
+                    evidence=replaced_title,
+                    confidence=0.7
+                )
+                db.session.add(relation)
+
+            db.session.commit()
+            print(f"Метаданные: {document.file_name}")
 
 if __name__ == "__main__":
-    run()
+    from app.web.app import create_app
+    app = create_app()
+    extract_all(app)

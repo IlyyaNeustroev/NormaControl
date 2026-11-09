@@ -54,3 +54,6 @@ data/processed/
 data/chunks/
 data/qdrant_local/
 notebooks/.ipynb_checkpoints/
+data/kuzu/
+data/exports/
+instance/
