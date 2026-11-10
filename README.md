@@ -5,7 +5,8 @@
 3. python -m app.graph.build_graph      
 4. python -m app.analysis.checklist 
 
-#Команда:
+# Команда: 
+
 Неустроев Илья (ИМО)
 Роман Лещишин (ИМО)
 Денис Савельвев (ИМО)
